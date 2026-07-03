@@ -10,7 +10,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onRefreshAppState }) => 
   const [auditLogs, setAuditLogs] = useState<{ id: string; time: string; event: string; type: 'info' | 'warn' }[]>([]);
 
   useEffect(() => {
-    setUsers(getAdminUsersList());
+    const loadUsers = async () => {
+      const list = await getAdminUsersList();
+      setUsers(list);
+    };
+    loadUsers();
     
     // Create random mock audits
     const events = [

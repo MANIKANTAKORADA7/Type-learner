@@ -1,4 +1,17 @@
-// Secure authentication utilities using SHA-256 hashing and LocalStorage.
+import { auth as firebaseAuth, db as firestoreDb } from './firebase';
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut
+} from 'firebase/auth';
+import {
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  collection,
+  getDocs
+} from 'firebase/firestore';
 
 export interface UserProfile {
   id: string;
@@ -45,21 +58,6 @@ export async function hashPassword(password: string): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Read database of users from localStorage
-const getUsersDB = (): Record<string, RegisteredUser> => {
-  const data = localStorage.getItem("typepulse_users_db");
-  return data ? JSON.parse(data) : {};
-};
-
-// Write database of users to localStorage
-const saveUsersDB = (db: Record<string, RegisteredUser>) => {
-  localStorage.setItem("typepulse_users_db", JSON.stringify(db));
-};
-
-// Rate Limit settings: Max 5 attempts, locked for 30 seconds
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 30000;
-
 // Password requirement checkers
 export interface PasswordRequirements {
   hasMinLength: boolean;
@@ -94,9 +92,7 @@ export function checkPasswordStrength(password: string): PasswordRequirements {
   return { hasMinLength, hasUpper, hasLower, hasNumber, hasSpecial, strength };
 }
 
-// Authentication Actions
-
-// 1. Sign Up
+// 1. Sign Up using Firebase Auth & Firestore
 export async function signUp(
   name: string,
   email: string,
@@ -105,36 +101,23 @@ export async function signUp(
   country: string,
   language: string
 ): Promise<{ success: boolean; message: string; email?: string }> {
-  const db = getUsersDB();
   const lowerEmail = email.toLowerCase().trim();
 
   if (lowerEmail === "admin@typepulse.com") {
     return { success: false, message: "This email address is reserved for system administration." };
   }
 
-  if (db[lowerEmail]) {
-    return { success: false, message: "An account with this email address already exists." };
-  }
+  try {
+    const userCredential = await createUserWithEmailAndPassword(firebaseAuth, lowerEmail, password);
+    const uid = userCredential.user.uid;
 
-  const requirements = checkPasswordStrength(password);
-  if (requirements.strength === 'Weak') {
-    return { success: false, message: "Password does not meet the minimum strength requirements." };
-  }
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+    console.log(`[SMTP SIMULATOR] Verification code for ${lowerEmail}: ${verificationCode}`);
 
-  // Create verification code
-  const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-  const passwordHash = await hashPassword(password);
+    const passwordHash = await hashPassword(password);
 
-  // Generate welcome code notification to screen
-  console.log(`[SMTP SIMULATOR] Verification code for ${email}: ${verificationCode}`);
-  
-  const newUser: RegisteredUser = {
-    passwordHash,
-    verified: false,
-    verificationCode,
-    failedAttempts: 0,
-    profile: {
-      id: Math.random().toString(36).substring(2, 11),
+    const newUserProfile: UserProfile = {
+      id: uid,
       name,
       email: lowerEmail,
       username: username || name.split(" ")[0] || "User",
@@ -155,64 +138,94 @@ export async function signUp(
       accuracy: 0,
       completedLessons: 0,
       achievements: []
+    };
+
+    const userDoc: RegisteredUser = {
+      profile: newUserProfile,
+      passwordHash,
+      verified: false,
+      verificationCode,
+      failedAttempts: 0
+    };
+
+    await setDoc(doc(firestoreDb, "users", lowerEmail), userDoc);
+    sessionStorage.setItem("typepulse_verifying_email", lowerEmail);
+
+    return { success: true, message: "Registration successful. Please enter your verification code.", email: lowerEmail };
+  } catch (err: any) {
+    console.error("Firebase Sign Up Error:", err);
+    let message = "Registration failed. Please check your credentials.";
+    if (err.code === "auth/email-already-in-use") {
+      message = "An account with this email address already exists.";
+    } else if (err.code === "auth/weak-password") {
+      message = "Password is too weak.";
     }
-  };
-
-  db[lowerEmail] = newUser;
-  saveUsersDB(db);
-
-  // Store transient signup email in sessionStorage to verify
-  sessionStorage.setItem("typepulse_verifying_email", lowerEmail);
-
-  return { success: true, message: "Registration successful. Please enter your verification code.", email: lowerEmail };
+    return { success: false, message };
+  }
 }
 
 // 2. Email Verification
 export async function verifyEmailCode(email: string, code: string): Promise<{ success: boolean; message: string; profile?: UserProfile }> {
-  const db = getUsersDB();
   const lowerEmail = email.toLowerCase().trim();
-  const user = db[lowerEmail];
+  try {
+    const userDocRef = doc(firestoreDb, "users", lowerEmail);
+    const userSnap = await getDoc(userDocRef);
 
-  if (!user) {
-    return { success: false, message: "Account not found." };
+    if (!userSnap.exists()) {
+      return { success: false, message: "Account not found." };
+    }
+
+    const userData = userSnap.data() as RegisteredUser;
+
+    if (userData.verified) {
+      return { success: true, message: "Account is already verified.", profile: userData.profile };
+    }
+
+    if (userData.verificationCode !== code.trim()) {
+      return { success: false, message: "Incorrect verification code. Please check and try again." };
+    }
+
+    await updateDoc(userDocRef, {
+      verified: true,
+      verificationCode: "",
+      "profile.lastLogin": new Date().toISOString()
+    });
+
+    userData.profile.lastLogin = new Date().toISOString();
+
+    const prefix = `typepulse_${lowerEmail.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+    localStorage.setItem(prefix + "profile", JSON.stringify(userData.profile));
+
+    sessionStorage.setItem("typepulse_session", lowerEmail);
+    sessionStorage.removeItem("typepulse_verifying_email");
+
+    return { success: true, message: "Email verified successfully!", profile: userData.profile };
+  } catch (err) {
+    console.error("Firebase Verify Email Error:", err);
+    return { success: false, message: "An error occurred during verification." };
   }
-
-  if (user.verified) {
-    return { success: true, message: "Account is already verified.", profile: user.profile };
-  }
-
-  if (user.verificationCode !== code.trim()) {
-    return { success: false, message: "Incorrect verification code. Please check and try again." };
-  }
-
-  user.verified = true;
-  delete user.verificationCode;
-  
-  // Set as current session
-  db[lowerEmail] = user;
-  saveUsersDB(db);
-  
-  sessionStorage.setItem("typepulse_session", lowerEmail);
-  sessionStorage.removeItem("typepulse_verifying_email");
-
-  return { success: true, message: "Email verified successfully!", profile: user.profile };
 }
 
 // Resend Verification Code
 export async function resendVerificationCode(email: string): Promise<{ success: boolean; message: string }> {
-  const db = getUsersDB();
   const lowerEmail = email.toLowerCase().trim();
-  const user = db[lowerEmail];
+  try {
+    const userDocRef = doc(firestoreDb, "users", lowerEmail);
+    const userSnap = await getDoc(userDocRef);
 
-  if (!user) return { success: false, message: "Account not found." };
+    if (!userSnap.exists()) return { success: false, message: "Account not found." };
 
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-  user.verificationCode = code;
-  db[lowerEmail] = user;
-  saveUsersDB(db);
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    await updateDoc(userDocRef, {
+      verificationCode: code
+    });
 
-  console.log(`[SMTP SIMULATOR] New Verification code for ${email}: ${code}`);
-  return { success: true, message: "A new verification code has been generated. Check console/screen overlay." };
+    console.log(`[SMTP SIMULATOR] New Verification code for ${lowerEmail}: ${code}`);
+    return { success: true, message: "A new verification code has been generated. Check console logs." };
+  } catch (err) {
+    console.error("Firebase Resend Error:", err);
+    return { success: false, message: "Failed to resend code." };
+  }
 }
 
 // 3. Login
@@ -221,19 +234,18 @@ export async function login(
   password: string,
   rememberMe: boolean
 ): Promise<{ success: boolean; message: string; profile?: UserProfile }> {
-  const db = getUsersDB();
   const lowerEmail = email.toLowerCase().trim();
 
   // Pre-seeded Admin Login
   if (lowerEmail === 'admin@typepulse.com') {
     if (password === 'AdminSecurePassword2026!') {
-      let adminUser = db[lowerEmail];
-      if (!adminUser) {
-        adminUser = {
-          passwordHash: "ADMIN_TOKEN_RESTRICTED",
-          verified: true,
-          failedAttempts: 0,
-          profile: {
+      try {
+        const userDocRef = doc(firestoreDb, "users", lowerEmail);
+        const userSnap = await getDoc(userDocRef);
+
+        let profile: UserProfile;
+        if (!userSnap.exists()) {
+          profile = {
             id: 'admin_sys_9999',
             name: "System Administrator",
             email: lowerEmail,
@@ -255,87 +267,129 @@ export async function login(
             accuracy: 99,
             completedLessons: 700,
             achievements: ["first_lesson", "speed_50", "speed_100", "accuracy_95", "accuracy_100", "words_1000", "curriculum_master"]
-          }
-        };
-        db[lowerEmail] = adminUser;
-        saveUsersDB(db);
-      } else {
-        adminUser.profile.lastLogin = new Date().toISOString();
-        db[lowerEmail] = adminUser;
-        saveUsersDB(db);
-      }
+          };
+          await setDoc(userDocRef, {
+            profile,
+            verified: true,
+            failedAttempts: 0,
+            passwordHash: "ADMIN_TOKEN_RESTRICTED"
+          });
+        } else {
+          const userData = userSnap.data() as RegisteredUser;
+          profile = userData.profile;
+          profile.lastLogin = new Date().toISOString();
+          await updateDoc(userDocRef, {
+            "profile.lastLogin": profile.lastLogin
+          });
+        }
 
-      if (rememberMe) {
-        localStorage.setItem("typepulse_session", lowerEmail);
-      } else {
-        sessionStorage.setItem("typepulse_session", lowerEmail);
-      }
+        const prefix = `typepulse_${lowerEmail.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+        localStorage.setItem(prefix + "profile", JSON.stringify(profile));
 
-      return { success: true, message: "Welcome back, System Administrator! Access granted.", profile: adminUser.profile };
+        if (rememberMe) {
+          localStorage.setItem("typepulse_session", lowerEmail);
+        } else {
+          sessionStorage.setItem("typepulse_session", lowerEmail);
+        }
+
+        return { success: true, message: "Welcome back, System Administrator! Access granted.", profile };
+      } catch (err) {
+        console.error("Firebase Admin Login Error:", err);
+        return { success: false, message: "Admin system error." };
+      }
     } else {
       return { success: false, message: "Incorrect administrator password." };
     }
   }
 
-  const user = db[lowerEmail];
+  try {
+    const userDocRef = doc(firestoreDb, "users", lowerEmail);
+    const userSnap = await getDoc(userDocRef);
 
-  if (!user) {
-    return { success: false, message: "Invalid email address or password." };
-  }
-
-  // Check rate limiting lockout
-  const now = Date.now();
-  if (user.lockUntil && user.lockUntil > now) {
-    const waitSeconds = Math.ceil((user.lockUntil - now) / 1000);
-    return { success: false, message: `Too many failed login attempts. Locked. Please wait ${waitSeconds}s.` };
-  }
-
-  const hash = await hashPassword(password);
-  if (user.passwordHash !== hash) {
-    user.failedAttempts += 1;
-    if (user.failedAttempts >= MAX_FAILED_ATTEMPTS) {
-      user.lockUntil = Date.now() + LOCKOUT_DURATION_MS;
-      user.failedAttempts = 0; // reset attempts after locking
+    if (!userSnap.exists()) {
+      return { success: false, message: "Invalid email address or password." };
     }
-    db[lowerEmail] = user;
-    saveUsersDB(db);
 
-    if (user.lockUntil) {
-      return { success: false, message: "Too many failed login attempts. Account locked for 30 seconds." };
+    const userData = userSnap.data() as RegisteredUser;
+
+    const now = Date.now();
+    if (userData.lockUntil && userData.lockUntil > now) {
+      const waitSeconds = Math.ceil((userData.lockUntil - now) / 1000);
+      return { success: false, message: `Too many failed login attempts. Locked. Please wait ${waitSeconds}s.` };
     }
-    return { success: false, message: `Incorrect password. ${MAX_FAILED_ATTEMPTS - user.failedAttempts} attempts remaining.` };
+
+    let firebaseSuccess = false;
+    try {
+      await signInWithEmailAndPassword(firebaseAuth, lowerEmail, password);
+      firebaseSuccess = true;
+    } catch {
+      const hash = await hashPassword(password);
+      if (userData.passwordHash === hash) {
+        firebaseSuccess = true;
+      }
+    }
+
+    if (!firebaseSuccess) {
+      const newFailedAttempts = (userData.failedAttempts || 0) + 1;
+      let lockUntil: number | null = null;
+      if (newFailedAttempts >= 5) {
+        lockUntil = Date.now() + 30000;
+        await updateDoc(userDocRef, {
+          failedAttempts: 0,
+          lockUntil
+        });
+        return { success: false, message: "Too many failed login attempts. Account locked for 30 seconds." };
+      } else {
+        await updateDoc(userDocRef, {
+          failedAttempts: newFailedAttempts
+        });
+        return { success: false, message: `Incorrect password. ${5 - newFailedAttempts} attempts remaining.` };
+      }
+    }
+
+    userData.profile.lastLogin = new Date().toISOString();
+
+    await updateDoc(userDocRef, {
+      failedAttempts: 0,
+      lockUntil: null,
+      "profile.lastLogin": userData.profile.lastLogin
+    });
+
+    if (!userData.verified) {
+      sessionStorage.setItem("typepulse_verifying_email", lowerEmail);
+      return { success: false, message: "Please verify your email address before logging in.", profile: userData.profile };
+    }
+
+    const prefix = `typepulse_${lowerEmail.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+    localStorage.setItem(prefix + "profile", JSON.stringify(userData.profile));
+    
+    if ((userData as any).settings) {
+      localStorage.setItem(prefix + "settings", JSON.stringify((userData as any).settings));
+    }
+    if ((userData as any).history) {
+      localStorage.setItem(prefix + "history", JSON.stringify((userData as any).history));
+    }
+    if ((userData as any).achievements) {
+      localStorage.setItem(prefix + "achievements", JSON.stringify((userData as any).achievements));
+    }
+
+    if (rememberMe) {
+      localStorage.setItem("typepulse_session", lowerEmail);
+    } else {
+      sessionStorage.setItem("typepulse_session", lowerEmail);
+    }
+
+    return { success: true, message: `Welcome back, ${userData.profile.name}!`, profile: userData.profile };
+  } catch (err: any) {
+    console.error("Firebase Login Error:", err);
+    return { success: false, message: "An unexpected authentication error occurred." };
   }
-
-  // Check verification
-  if (!user.verified) {
-    sessionStorage.setItem("typepulse_verifying_email", lowerEmail);
-    return { success: false, message: "Please verify your email address before logging in.", profile: user.profile };
-  }
-
-  // Reset failed attempts
-  user.failedAttempts = 0;
-  user.lockUntil = undefined;
-  user.profile.lastLogin = new Date().toISOString();
-  db[lowerEmail] = user;
-  saveUsersDB(db);
-
-  // Set session
-  if (rememberMe) {
-    localStorage.setItem("typepulse_session", lowerEmail);
-  } else {
-    sessionStorage.setItem("typepulse_session", lowerEmail);
-  }
-
-  return { success: true, message: `Welcome back, ${user.profile.name}!`, profile: user.profile };
 }
 
 // 4. Social Login Simulation
 export async function socialLogin(
   provider: 'google' | 'github' | 'microsoft' | 'apple'
 ): Promise<{ success: boolean; profile: UserProfile; isNewUser: boolean }> {
-  const db = getUsersDB();
-  
-  // Mock profiles for providers
   const mockNames = {
     google: "G-User Alpha",
     github: "git-dev-expert",
@@ -353,16 +407,16 @@ export async function socialLogin(
   const email = `${provider}_user_${Math.floor(1000 + Math.random() * 9000)}@${provider}.com`;
   const lowerEmail = email.toLowerCase();
   
-  let user = db[lowerEmail];
-  let isNewUser = false;
+  try {
+    const userDocRef = doc(firestoreDb, "users", lowerEmail);
+    const userSnap = await getDoc(userDocRef);
 
-  if (!user) {
-    isNewUser = true;
-    user = {
-      passwordHash: "SOCIAL_LOGIN_TOKEN",
-      verified: true,
-      failedAttempts: 0,
-      profile: {
+    let profile: UserProfile;
+    let isNewUser = false;
+
+    if (!userSnap.exists()) {
+      isNewUser = true;
+      profile = {
         id: `${provider}_${Math.random().toString(36).substring(2, 9)}`,
         name,
         email: lowerEmail,
@@ -384,62 +438,103 @@ export async function socialLogin(
         accuracy: 0,
         completedLessons: 0,
         achievements: []
-      }
+      };
+      await setDoc(userDocRef, {
+        profile,
+        verified: true,
+        failedAttempts: 0,
+        passwordHash: "SOCIAL_LOGIN_TOKEN"
+      });
+    } else {
+      const userData = userSnap.data() as RegisteredUser;
+      profile = userData.profile;
+      profile.lastLogin = new Date().toISOString();
+      await updateDoc(userDocRef, {
+        "profile.lastLogin": profile.lastLogin
+      });
+    }
+
+    const prefix = `typepulse_${lowerEmail.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+    localStorage.setItem(prefix + "profile", JSON.stringify(profile));
+    localStorage.setItem("typepulse_session", lowerEmail);
+
+    return { success: true, profile, isNewUser };
+  } catch (err) {
+    console.error("Social login error:", err);
+    const offlineProfile: UserProfile = {
+      id: `${provider}_offline`,
+      name,
+      email: lowerEmail,
+      username: `${provider}_offline`,
+      avatar: mockAvatars[provider],
+      level: 1,
+      xp: 0,
+      coins: 50,
+      joinedDate: new Date().toLocaleDateString(),
+      dailyStreak: 1,
+      lastActiveDate: new Date().toLocaleDateString(),
+      rank: "Beginner",
+      country: "US",
+      language: "EN",
+      createdDate: new Date().toISOString(),
+      lastLogin: new Date().toISOString()
     };
-    db[lowerEmail] = user;
-    saveUsersDB(db);
-  } else {
-    user.profile.lastLogin = new Date().toISOString();
-    db[lowerEmail] = user;
-    saveUsersDB(db);
+    localStorage.setItem("typepulse_session", lowerEmail);
+    return { success: true, profile: offlineProfile, isNewUser: true };
   }
-
-  // Log in
-  localStorage.setItem("typepulse_session", lowerEmail);
-
-  return { success: true, profile: user.profile, isNewUser };
 }
 
 // 5. Forgot Password
 export async function forgotPassword(email: string): Promise<{ success: boolean; message: string }> {
-  const db = getUsersDB();
   const lowerEmail = email.toLowerCase().trim();
-  const user = db[lowerEmail];
+  try {
+    const userDocRef = doc(firestoreDb, "users", lowerEmail);
+    const userSnap = await getDoc(userDocRef);
 
-  if (!user) {
-    // Return success to prevent email enumeration attacks (production best practice)
-    return { success: true, message: "If the email is registered, a password reset link has been sent." };
+    if (!userSnap.exists()) {
+      return { success: false, message: "No account found with this email address." };
+    }
+
+    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    await updateDoc(userDocRef, {
+      resetCode
+    });
+
+    console.log(`[SMTP SIMULATOR] Reset Password code for ${email}: ${resetCode}`);
+    return { success: true, message: "Password reset code has been sent. Check console logs." };
+  } catch (err) {
+    console.error("Firebase Forgot Password Error:", err);
+    return { success: false, message: "Failed to request password reset." };
   }
-
-  const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-  user.resetCode = resetCode;
-  db[lowerEmail] = user;
-  saveUsersDB(db);
-
-  console.log(`[SMTP SIMULATOR] Reset Password code for ${email}: ${resetCode}`);
-  return { success: true, message: "Password reset link has been sent. Check console/screen overlay." };
 }
 
 // 6. Reset Password
 export async function resetPassword(email: string, code: string, passwordHashValue: string): Promise<{ success: boolean; message: string }> {
-  const db = getUsersDB();
   const lowerEmail = email.toLowerCase().trim();
-  const user = db[lowerEmail];
+  try {
+    const userDocRef = doc(firestoreDb, "users", lowerEmail);
+    const userSnap = await getDoc(userDocRef);
 
-  if (!user) {
-    return { success: false, message: "Account not found." };
+    if (!userSnap.exists()) {
+      return { success: false, message: "Account not found." };
+    }
+
+    const userData = userSnap.data() as RegisteredUser;
+
+    if (!userData.resetCode || userData.resetCode !== code.trim()) {
+      return { success: false, message: "Incorrect or expired reset code." };
+    }
+
+    await updateDoc(userDocRef, {
+      passwordHash: passwordHashValue,
+      resetCode: ""
+    });
+
+    return { success: true, message: "Password has been reset successfully. You can now login." };
+  } catch (err) {
+    console.error("Firebase Reset Password Error:", err);
+    return { success: false, message: "Failed to reset password." };
   }
-
-  if (!user.resetCode || user.resetCode !== code.trim()) {
-    return { success: false, message: "Incorrect or expired reset code." };
-  }
-
-  user.passwordHash = passwordHashValue;
-  delete user.resetCode;
-  db[lowerEmail] = user;
-  saveUsersDB(db);
-
-  return { success: true, message: "Password has been reset successfully. You can now login." };
 }
 
 // 7. Get Current User profile from session
@@ -451,9 +546,12 @@ export function getCurrentUser(): UserProfile | null {
   const email = getCurrentSessionEmail();
   if (!email) return null;
 
-  const db = getUsersDB();
-  const user = db[email];
-  return user ? user.profile : null;
+  const prefix = `typepulse_${email.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+  const cachedProfile = localStorage.getItem(prefix + "profile");
+  if (cachedProfile) {
+    return JSON.parse(cachedProfile);
+  }
+  return null;
 }
 
 // 8. Logout
@@ -461,23 +559,42 @@ export function logout() {
   localStorage.removeItem("typepulse_session");
   sessionStorage.removeItem("typepulse_session");
   sessionStorage.removeItem("typepulse_verifying_email");
+  signOut(firebaseAuth).catch(err => console.error("Firebase SignOut error:", err));
 }
 
 // 9. Update profile
 export function updateProfileInDB(email: string, updatedProfile: UserProfile) {
-  const db = getUsersDB();
-  const user = db[email.toLowerCase().trim()];
-  if (user) {
-    user.profile = { ...user.profile, ...updatedProfile };
-    db[email.toLowerCase().trim()] = user;
-    saveUsersDB(db);
-  }
+  const lowerEmail = email.toLowerCase().trim();
+  const prefix = `typepulse_${lowerEmail.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+  localStorage.setItem(prefix + "profile", JSON.stringify(updatedProfile));
+
+  const userDocRef = doc(firestoreDb, "users", lowerEmail);
+  updateDoc(userDocRef, {
+    profile: updatedProfile
+  }).catch(err => console.error("Firestore Profile Sync Error:", err));
 }
 
 // 10. Admin controls
-export function getAdminUsersList(): UserProfile[] {
-  const db = getUsersDB();
-  return Object.values(db).map(u => u.profile);
+export async function getAdminUsersList(): Promise<UserProfile[]> {
+  try {
+    const querySnapshot = await getDocs(collection(firestoreDb, "users"));
+    const list: UserProfile[] = [];
+    querySnapshot.forEach((docSnap) => {
+      const data = docSnap.data() as RegisteredUser;
+      if (data && data.profile) {
+        list.push(data.profile);
+      }
+    });
+    return list;
+  } catch (err) {
+    console.error("Firestore getAdminUsersList error:", err);
+    const data = localStorage.getItem("typepulse_users_db");
+    if (data) {
+      const db = JSON.parse(data);
+      return Object.values(db).map((u: any) => u.profile);
+    }
+    return [];
+  }
 }
 
 export function pruneAllUsers() {

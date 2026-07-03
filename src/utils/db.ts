@@ -1,4 +1,6 @@
 import { getCurrentSessionEmail } from './auth';
+import { db as firestoreDb } from './firebase';
+import { doc, updateDoc } from 'firebase/firestore';
 
 export interface UserProfile {
   id?: string;
@@ -131,17 +133,12 @@ export const saveProfile = (profile: UserProfile) => {
   const prefix = getPrefix();
   localStorage.setItem(prefix + "profile", JSON.stringify(profile));
 
-  // Sync to users database too if they are logged in
   const email = getCurrentSessionEmail();
   if (email) {
-    const usersData = localStorage.getItem("typepulse_users_db");
-    if (usersData) {
-      const db = JSON.parse(usersData);
-      if (db[email]) {
-        db[email].profile = profile;
-        localStorage.setItem("typepulse_users_db", JSON.stringify(db));
-      }
-    }
+    const userDocRef = doc(firestoreDb, "users", email.toLowerCase().trim());
+    updateDoc(userDocRef, {
+      profile: profile
+    }).catch(err => console.error("Firestore saveProfile error:", err));
   }
 };
 
@@ -158,6 +155,14 @@ export const loadSettings = (): UserSettings => {
 export const saveSettings = (settings: UserSettings) => {
   const prefix = getPrefix();
   localStorage.setItem(prefix + "settings", JSON.stringify(settings));
+
+  const email = getCurrentSessionEmail();
+  if (email) {
+    const userDocRef = doc(firestoreDb, "users", email.toLowerCase().trim());
+    updateDoc(userDocRef, {
+      settings: settings
+    }).catch(err => console.error("Firestore saveSettings error:", err));
+  }
 };
 
 export const loadHistory = (): TypingSession[] => {
@@ -169,6 +174,14 @@ export const loadHistory = (): TypingSession[] => {
 export const saveHistory = (history: TypingSession[]) => {
   const prefix = getPrefix();
   localStorage.setItem(prefix + "history", JSON.stringify(history));
+
+  const email = getCurrentSessionEmail();
+  if (email) {
+    const userDocRef = doc(firestoreDb, "users", email.toLowerCase().trim());
+    updateDoc(userDocRef, {
+      history: history
+    }).catch(err => console.error("Firestore saveHistory error:", err));
+  }
 };
 
 export const loadAchievements = (): Achievement[] => {
@@ -184,6 +197,14 @@ export const loadAchievements = (): Achievement[] => {
 export const saveAchievements = (achievements: Achievement[]) => {
   const prefix = getPrefix();
   localStorage.setItem(prefix + "achievements", JSON.stringify(achievements));
+
+  const email = getCurrentSessionEmail();
+  if (email) {
+    const userDocRef = doc(firestoreDb, "users", email.toLowerCase().trim());
+    updateDoc(userDocRef, {
+      achievements: achievements
+    }).catch(err => console.error("Firestore saveAchievements error:", err));
+  }
 };
 
 // Maps lessonNum -> starsEarned (1-5)
@@ -196,6 +217,14 @@ export const loadCompletedLessonsMap = (): Record<number, number> => {
 export const saveCompletedLessonsMap = (map: Record<number, number>) => {
   const prefix = getPrefix();
   localStorage.setItem(prefix + "completed_lessons_map", JSON.stringify(map));
+
+  const email = getCurrentSessionEmail();
+  if (email) {
+    const userDocRef = doc(firestoreDb, "users", email.toLowerCase().trim());
+    updateDoc(userDocRef, {
+      completedLessonsMap: map
+    }).catch(err => console.error("Firestore saveCompletedLessonsMap error:", err));
+  }
 };
 
 // Determine Rank based on completed lessons

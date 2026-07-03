@@ -19,9 +19,11 @@ import { Onboarding } from './components/Onboarding';
 import { AdminPanel } from './components/AdminPanel';
 import { AuthLayout } from './components/AuthLayout';
 
-import { getCurrentUser, logout } from './utils/auth';
+import { getCurrentUser, logout, getCurrentSessionEmail } from './utils/auth';
 import { loadProfile, loadSettings, type UserProfile, type UserSettings, recordSession } from './utils/db';
 import { type FinalSessionStats, type SessionSnapshot } from './types/typing';
+import { doc, getDoc } from 'firebase/firestore';
+import { db } from './utils/firebase';
 
 function App() {
   const [tab, setTab] = useState<string>('home');
@@ -66,6 +68,34 @@ function App() {
 
   useEffect(() => {
     syncUserSession();
+
+    // Background fetch latest user stats from Cloud Firestore
+    const email = getCurrentSessionEmail();
+    if (email && email !== 'admin@typepulse.com') {
+      const fetchLatest = async () => {
+        try {
+          const userDocRef = doc(db, "users", email.toLowerCase().trim());
+          const userSnap = await getDoc(userDocRef);
+          if (userSnap.exists()) {
+            const userData = userSnap.data() as any;
+            if (userData && userData.profile) {
+              const prefix = `typepulse_${email.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+              localStorage.setItem(prefix + "profile", JSON.stringify(userData.profile));
+              if (userData.settings) localStorage.setItem(prefix + "settings", JSON.stringify(userData.settings));
+              if (userData.history) localStorage.setItem(prefix + "history", JSON.stringify(userData.history));
+              if (userData.achievements) localStorage.setItem(prefix + "achievements", JSON.stringify(userData.achievements));
+              if (userData.completedLessonsMap) localStorage.setItem(prefix + "completed_lessons_map", JSON.stringify(userData.completedLessonsMap));
+              
+              setCurrentUser(userData.profile);
+              setSettings(userData.settings || loadSettings());
+            }
+          }
+        } catch (err) {
+          console.error("Firestore startup sync failed:", err);
+        }
+      };
+      fetchLatest();
+    }
   }, []);
 
   // Enforce admin panel routing security
